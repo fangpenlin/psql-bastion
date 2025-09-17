@@ -1,5 +1,7 @@
+import functools
 import logging
 import typing
+from concurrent.futures import ThreadPoolExecutor
 
 import click
 import psycopg
@@ -21,7 +23,6 @@ PG_TO_ARROW = {
     "timestamp": pa.timestamp("ns"),
     "date": pa.date32(),
 }
-DB_URL = "postgres://infisical:infisical@localhost:5432/infisical"
 
 
 def fetch_type_info_by_oid(conn, oid):
@@ -38,6 +39,12 @@ def fetch_type_info_by_oid(conn, oid):
 
 
 class Connection(riffq.BaseConnection):
+    def __init__(
+        self, dest_url: str, conn_id: typing.Any, executor: ThreadPoolExecutor
+    ):
+        super().__init__(conn_id, executor)
+        self.dest_url = dest_url
+
     def handle_auth(
         self,
         user: str,
@@ -47,9 +54,8 @@ class Connection(riffq.BaseConnection):
         callback: typing.Callable = callable,
     ):
         logger.info(
-            "Received auth req, user=%s, password=%s, host=%s, db=%s",
+            "Received auth req, user=%s, host=%s, db=%s",
             user,
-            password,
             host,
             database,
         )
@@ -60,7 +66,8 @@ class Connection(riffq.BaseConnection):
     def handle_connect(self, ip: str, port: int, callback: typing.Callable = callable):
         logger.info("Connected, ip=%s, port=%s", ip, port)
 
-        self.outgoing_conn = psycopg.connect(DB_URL)
+        self.outgoing_conn = psycopg.connect(self.dest_url)
+        # TODO: run some simple test to ensure the connection is good?
         # allow every incoming connection
         callback(True)
 
@@ -78,7 +85,7 @@ class Connection(riffq.BaseConnection):
                 cursor.execute(sql)
                 schema = pa.schema(
                     [
-                        # TODO: this fetch_type_info_by_oid is very slow, maybe we should cache it or query all at once
+                        # TODO: this fetch_type_info_by_oid is slow, maybe we should cache it or query all at once
                         #       instead?
                         (
                             desc[0],
@@ -125,7 +132,9 @@ class Connection(riffq.BaseConnection):
     "--port", default=5433, help="Port number to listen for incoming connections."
 )
 def main(db_url: str, host: str, port: int):
-    server = riffq.RiffqServer(f"{host}:{port}", connection_cls=Connection)
+    server = riffq.RiffqServer(
+        f"{host}:{port}", connection_cls=functools.partial(Connection, db_url)
+    )
     server.start(tls=False)
 
 
