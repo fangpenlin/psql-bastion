@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 import click
 import psycopg
 import pyarrow as pa
+import pytz
 import riffq
 
 
@@ -23,8 +24,9 @@ PG_TO_ARROW = {
     "varchar": pa.string(),
     "char": pa.string(),
     "bool": pa.bool_(),
-    "uuid": pa.string(),
+    "uuid": pa.uuid(),
     "timestamp": pa.timestamp("ns"),
+    "timestampz": pa.timestamp("ns", tz="UTC"),
     "date": pa.date32(),
 }
 
@@ -57,7 +59,12 @@ def to_pa_types(rows: list) -> typing.Generator[tuple, None, None]:
         values = []
         for value in row:
             if isinstance(value, uuid.UUID):
-                value = str(value)
+                value = value.bytes
+            elif isinstance(values, datetime.datetime):
+                if value.tzinfo is not None:
+                    value = value.astimezone(pytz.UTC)
+                else:
+                    value = value
             values.append(value)
         yield tuple(values)
 

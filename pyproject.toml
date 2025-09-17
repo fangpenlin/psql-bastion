@@ -8,5 +8,6 @@ dependencies = [
     "click>=8.2.1",
     "psycopg[binary]>=3.2.10",
     "pyarrow>=21.0.0",
+    "pytz>=2025.2",
     "riffq>=0.1.6",
 ]
