@@ -51,7 +51,7 @@ class Connection(riffq.BaseConnection):
         callback(True)
 
     def _handle_query(self, sql, callback, **kwargs):
-        logger.info("SQL sql=%s", sql)
+        logger.info("SQL sql=%r", sql)
         try:
             with self.outgoing_conn.cursor() as cursor:
                 cursor.execute(sql)
