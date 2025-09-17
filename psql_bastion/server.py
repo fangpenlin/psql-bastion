@@ -23,6 +23,7 @@ PG_TO_ARROW = {
     "varchar": pa.string(),
     "char": pa.string(),
     "bool": pa.bool_(),
+    "uuid": pa.string(),
     "timestamp": pa.timestamp("ns"),
     "date": pa.date32(),
 }
@@ -49,6 +50,16 @@ def fetch_type_info_by_oid(conn, oid):
             (oid,),
         )
         return cur.fetchone()[0]
+
+
+def to_pa_types(rows: list) -> typing.Generator[tuple, None, None]:
+    for row in rows:
+        values = []
+        for value in row:
+            if isinstance(value, uuid.UUID):
+                value = str(value)
+            values.append(value)
+        yield tuple(values)
 
 
 class Observer:
@@ -191,7 +202,7 @@ class Connection(riffq.BaseConnection):
                 )
                 # TODO: well... if this is huge, ideally we want to stream the result back to the client
                 rows = cursor.fetchall()
-                data_columns = list(zip(*rows))
+                data_columns = list(zip(*to_pa_types(rows)))
                 if self.observer is not None:
                     self.observer.query_response(columns=columns, rows=list(rows))
                 # Convert data to PyArrow arrays
