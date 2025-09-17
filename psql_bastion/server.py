@@ -1,8 +1,10 @@
+import datetime
 import functools
 import json
 import logging
 import pathlib
 import typing
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import click
@@ -26,6 +28,14 @@ PG_TO_ARROW = {
 }
 
 logger = logging.getLogger(__name__)
+
+
+def types_to_json(obj):
+    if isinstance(obj, uuid.UUID):
+        return str(obj)
+    if isinstance(obj, datetime.datetime):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
 
 def fetch_type_info_by_oid(conn, oid):
@@ -92,7 +102,8 @@ class AuditTrail(Observer):
         self._emit_event(dict(event="DISCONNECTED", ip=ip, port=port))
 
     def _emit_event(self, payload: dict):
-        self.file.write(json.dumps(payload) + "\n")
+        self.file.write(json.dumps(payload, default=types_to_json) + "\n")
+        self.file.flush()
 
 
 class Connection(riffq.BaseConnection):
