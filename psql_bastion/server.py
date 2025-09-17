@@ -1,66 +1,97 @@
 import logging
-import riffq
+import typing
+
+import click
 import psycopg
 import pyarrow as pa
-from psycopg.types import TypeInfo
+import riffq
 
 logger = logging.getLogger(__name__)
 
 PG_TO_ARROW = {
-    'int2': pa.int16(),
-    'int4': pa.int32(),
-    'int8': pa.int64(),
-    'float4': pa.float32(),
-    'float8': pa.float64(),
-    'text': pa.string(),
-    'varchar': pa.string(),
-    'char': pa.string(),
-    'bool': pa.bool_(),
-    'timestamp': pa.timestamp('ns'),
-    'date': pa.date32(),
+    "int2": pa.int16(),
+    "int4": pa.int32(),
+    "int8": pa.int64(),
+    "float4": pa.float32(),
+    "float8": pa.float64(),
+    "text": pa.string(),
+    "varchar": pa.string(),
+    "char": pa.string(),
+    "bool": pa.bool_(),
+    "timestamp": pa.timestamp("ns"),
+    "date": pa.date32(),
 }
-DB_URL = 'postgres://infisical:infisical@localhost:5432/infisical'
+DB_URL = "postgres://infisical:infisical@localhost:5432/infisical"
+
 
 def fetch_type_info_by_oid(conn, oid):
     with conn.cursor() as cur:
-        cur.execute("""
+        cur.execute(
+            """
             SELECT t.typname
             FROM pg_type t
             WHERE t.oid = %s
-        """, (oid,))
+        """,
+            (oid,),
+        )
         return cur.fetchone()[0]
 
 
 class Connection(riffq.BaseConnection):
-    def handle_auth(self, user, password, host, database=None, callback=callable):
-        logger.info("Received auth req, user=%s, password=%s, host=%s, db=%s", user, password, host, database)
+    def handle_auth(
+        self,
+        user: str,
+        password: str,
+        host: str,
+        database: str = None,
+        callback: typing.Callable = callable,
+    ):
+        logger.info(
+            "Received auth req, user=%s, password=%s, host=%s, db=%s",
+            user,
+            password,
+            host,
+            database,
+        )
         # TODO: check credentials
         # callback(user == "user" and password == "secret")
         callback(True)
 
-    def handle_connect(self, ip, port, callback=callable):
+    def handle_connect(self, ip: str, port: int, callback: typing.Callable = callable):
         logger.info("Connected, ip=%s, port=%s", ip, port)
 
         self.outgoing_conn = psycopg.connect(DB_URL)
         # allow every incoming connection
         callback(True)
 
-    def handle_disconnect(self, ip, port, callback=callable):
+    def handle_disconnect(
+        self, ip: str, port: int, callback: typing.Callable = callable
+    ):
         logger.info("Disconnect, ip=%s, port=%s", ip, port)
         # invoked when client disconnects
         callback(True)
 
-    def _handle_query(self, sql, callback, **kwargs):
+    def _handle_query(self, sql: str, callback: typing.Callable, **kwargs):
         logger.info("SQL sql=%r", sql)
         try:
             with self.outgoing_conn.cursor() as cursor:
                 cursor.execute(sql)
-                schema = pa.schema([
-                    # TODO: this fetch_type_info_by_oid is very slow, maybe we should cache it or query all at once
-                    #       instead?
-                    (desc[0], PG_TO_ARROW.get(fetch_type_info_by_oid(self.outgoing_conn, desc.type_code), pa.string()))
-                    for desc in cursor.description
-                ])
+                schema = pa.schema(
+                    [
+                        # TODO: this fetch_type_info_by_oid is very slow, maybe we should cache it or query all at once
+                        #       instead?
+                        (
+                            desc[0],
+                            PG_TO_ARROW.get(
+                                fetch_type_info_by_oid(
+                                    self.outgoing_conn, desc.type_code
+                                ),
+                                pa.string(),
+                            ),
+                        )
+                        for desc in cursor.description
+                    ]
+                )
                 # TODO: well... if this is huge, ideally we want to stream the result back to the client
                 rows = cursor.fetchall()
                 data_columns = list(zip(*rows))
@@ -81,12 +112,22 @@ class Connection(riffq.BaseConnection):
             )
             self.send_reader(batch, callback)
 
-    def handle_query(self, sql, callback=callable, **kwargs):
+    def handle_query(self, sql: str, callback: typing.Callable = callable, **kwargs):
         self.executor.submit(self._handle_query, sql, callback, **kwargs)
 
-def main():
-    server = riffq.RiffqServer("127.0.0.1:5433", connection_cls=Connection)
+
+@click.command()
+@click.argument("DB_URL")
+@click.option(
+    "--host", default="localhost", help="The interface to listen connection from"
+)
+@click.option(
+    "--port", default=5433, help="Port number to listen for incoming connections."
+)
+def main(db_url: str, host: str, port: int):
+    server = riffq.RiffqServer(f"{host}:{port}", connection_cls=Connection)
     server.start(tls=False)
+
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
