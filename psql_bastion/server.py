@@ -3,6 +3,7 @@ import functools
 import json
 import logging
 import pathlib
+import secrets
 import typing
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -72,6 +73,21 @@ def to_pa_types(rows: list) -> typing.Generator[tuple, None, None]:
         yield tuple(values)
 
 
+class DictLookupAuth:
+    def __init__(self, user_pwd: dict):
+        self.user_pwd = user_pwd
+
+    def __call__(self, username: str, password: str) -> bool:
+        expected_pwd = self.user_pwd.get(username)
+        # We compare the password with a string regardless to avoid any timing side channel attack
+        cmp_result = secrets.compare_digest(
+            password, expected_pwd if expected_pwd is not None else ""
+        )
+        # Check cmp_result first then expected_pwd to avoid return early (short circuit)
+        # TODO: maybe there's a better way to do this
+        return cmp_result and expected_pwd is not None
+
+
 class Observer:
     def init(self, conn_id: typing.Any):
         raise NotImplementedError()
@@ -132,12 +148,14 @@ class Connection(riffq.BaseConnection):
         self,
         dest_url: str,
         observer: Observer | None,
+        authenticator: typing.Callable | None,
         conn_id: typing.Any,
         executor: ThreadPoolExecutor,
     ):
         super().__init__(conn_id, executor)
-        self.observer = observer
         self.dest_url = dest_url
+        self.observer = observer
+        self.authenticator = authenticator
         if self.observer is not None:
             self.observer.init(conn_id)
 
@@ -159,9 +177,12 @@ class Connection(riffq.BaseConnection):
             self.observer.auth(
                 user=user, password=password, host=host, database=database
             )
-        # TODO: check credentials
-        # callback(user == "user" and password == "secret")
-        callback(True)
+        # TODO: it's dangerous to have auth disabled by default, should at least generate some random pwd and output
+        #       in the console in case if authenticator is not provided
+        result = True
+        if self.authenticator is not None:
+            result = self.authenticator(user, password)
+        callback(result)
 
     def handle_connect(self, ip: str, port: int, callback: typing.Callable = callable):
         logger.info("Connected, ip=%s, port=%s", ip, port)
@@ -254,16 +275,29 @@ class Connection(riffq.BaseConnection):
 )
 @click.option(
     "--audit-trail",
-    type=click.Path(dir_okay=True, file_okay=False, writable=True),
+    type=click.Path(dir_okay=True, file_okay=False, writable=True, exists=True),
     help="Write audit trial files to the given folder",
 )
-def main(db_url: str, host: str, port: int, audit_trail: str | None):
+@click.option(
+    "--auth-json",
+    type=click.Path(dir_okay=False, readable=True, exists=True),
+    help="JSON file contains auth info for incoming connections",
+)
+def main(
+    db_url: str, host: str, port: int, audit_trail: str | None, auth_json: str | None
+):
     if audit_trail is not None:
         audit_trail = AuditTrail(folder=pathlib.Path(audit_trail))
+    authenticator = None
+    if auth_json is not None:
+        auth_json = json.loads(pathlib.Path(auth_json).read_text())
+        authenticator = DictLookupAuth(auth_json)
 
     server = riffq.RiffqServer(
         f"{host}:{port}",
-        connection_cls=functools.partial(Connection, db_url, audit_trail),
+        connection_cls=functools.partial(
+            Connection, db_url, audit_trail, authenticator
+        ),
     )
     server.start(tls=False)
 
