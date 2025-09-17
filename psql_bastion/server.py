@@ -24,9 +24,12 @@ PG_TO_ARROW = {
     "varchar": pa.string(),
     "char": pa.string(),
     "bool": pa.bool_(),
-    "uuid": pa.uuid(),
-    "timestamp": pa.timestamp("ns"),
-    "timestampz": pa.timestamp("ns", tz="UTC"),
+    # TODO: should this be native uuid type instead? We have some difficulty to convert it to uuid value
+    "uuid": pa.string(),
+    # TODO: should this be pa.timestamp("ns") instead? We have some difficulty to convert it to datetime value
+    "timestamp": pa.string(),
+    # TODO: should this be pa.timestamp("ns", tz="UTC") instead? We have some difficulty to convert it to datetime value
+    "timestampz": pa.string(),
     "date": pa.date32(),
 }
 
@@ -59,12 +62,12 @@ def to_pa_types(rows: list) -> typing.Generator[tuple, None, None]:
         values = []
         for value in row:
             if isinstance(value, uuid.UUID):
-                value = value.bytes
+                value = str(value)
             elif isinstance(values, datetime.datetime):
                 if value.tzinfo is not None:
-                    value = value.astimezone(pytz.UTC)
+                    value = str(value.astimezone(pytz.UTC))
                 else:
-                    value = value
+                    value = str(value)
             values.append(value)
         yield tuple(values)
 
