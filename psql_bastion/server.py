@@ -1,5 +1,7 @@
 import functools
+import json
 import logging
+import pathlib
 import typing
 from concurrent.futures import ThreadPoolExecutor
 
@@ -8,7 +10,6 @@ import psycopg
 import pyarrow as pa
 import riffq
 
-logger = logging.getLogger(__name__)
 
 PG_TO_ARROW = {
     "int2": pa.int16(),
@@ -24,6 +25,8 @@ PG_TO_ARROW = {
     "date": pa.date32(),
 }
 
+logger = logging.getLogger(__name__)
+
 
 def fetch_type_info_by_oid(conn, oid):
     with conn.cursor() as cur:
@@ -38,12 +41,73 @@ def fetch_type_info_by_oid(conn, oid):
         return cur.fetchone()[0]
 
 
+class Observer:
+    def init(self, conn_id: typing.Any):
+        raise NotImplementedError()
+
+    def connected(self, ip: str, port: int):
+        raise NotImplementedError()
+
+    def auth(self, user: str, password: str, host: str, database: str = None):
+        raise NotImplementedError()
+
+    def query(self, sql: str):
+        raise NotImplementedError()
+
+    def query_response(self, columns: list[dict], response: list[tuple]):
+        raise NotImplementedError()
+
+    def query_error(self, error: str):
+        raise NotImplementedError()
+
+    def disconnected(self, ip: str, port: int):
+        raise NotImplementedError()
+
+
+class AuditTrail(Observer):
+    def __init__(self, folder: pathlib.Path):
+        self.folder = folder
+
+    def init(self, conn_id: typing.Any):
+        self.file = (self.folder / f"{conn_id}.jsonl").open("wt")
+
+    def connected(self, ip: str, port: int):
+        self._emit_event(dict(event="CONNECTED", ip=ip, port=port))
+
+    def auth(self, user: str, password: str, host: str, database: str = None):
+        self._emit_event(
+            dict(event="AUTH", user=user, password=password, host=host, db=database)
+        )
+
+    def query(self, sql: str):
+        self._emit_event(dict(event="QUERY", sql=sql))
+
+    def query_response(self, columns: list[dict], rows: list[tuple]):
+        self._emit_event(dict(event="QUERY_RESPONSE", columns=columns, rows=rows))
+
+    def query_error(self, error: str):
+        self._emit_event(dict(event="QUERY_ERROR", error=error))
+
+    def disconnected(self, ip: str, port: int):
+        self._emit_event(dict(event="DISCONNECTED", ip=ip, port=port))
+
+    def _emit_event(self, payload: dict):
+        self.file.write(json.dumps(payload) + "\n")
+
+
 class Connection(riffq.BaseConnection):
     def __init__(
-        self, dest_url: str, conn_id: typing.Any, executor: ThreadPoolExecutor
+        self,
+        dest_url: str,
+        observer: Observer | None,
+        conn_id: typing.Any,
+        executor: ThreadPoolExecutor,
     ):
         super().__init__(conn_id, executor)
+        self.observer = observer
         self.dest_url = dest_url
+        if self.observer is not None:
+            self.observer.init(conn_id)
 
     def handle_auth(
         self,
@@ -59,12 +123,18 @@ class Connection(riffq.BaseConnection):
             host,
             database,
         )
+        if self.observer is not None:
+            self.observer.auth(
+                user=user, password=password, host=host, database=database
+            )
         # TODO: check credentials
         # callback(user == "user" and password == "secret")
         callback(True)
 
     def handle_connect(self, ip: str, port: int, callback: typing.Callable = callable):
         logger.info("Connected, ip=%s, port=%s", ip, port)
+        if self.observer is not None:
+            self.observer.connected(ip, port)
 
         self.outgoing_conn = psycopg.connect(self.dest_url)
         # TODO: run some simple test to ensure the connection is good?
@@ -75,33 +145,44 @@ class Connection(riffq.BaseConnection):
         self, ip: str, port: int, callback: typing.Callable = callable
     ):
         logger.info("Disconnect, ip=%s, port=%s", ip, port)
+        if self.observer is not None:
+            self.observer.disconnected(ip, port)
         # invoked when client disconnects
         callback(True)
 
     def _handle_query(self, sql: str, callback: typing.Callable, **kwargs):
         logger.info("SQL sql=%r", sql)
+        if self.observer is not None:
+            self.observer.query(sql=sql)
         try:
             with self.outgoing_conn.cursor() as cursor:
                 cursor.execute(sql)
+                columns = [
+                    # TODO: this fetch_type_info_by_oid is slow, maybe we should cache it or query all at once
+                    #       instead?
+                    dict(
+                        name=desc[0],
+                        type=fetch_type_info_by_oid(self.outgoing_conn, desc.type_code),
+                    )
+                    for desc in cursor.description
+                ]
                 schema = pa.schema(
                     [
-                        # TODO: this fetch_type_info_by_oid is slow, maybe we should cache it or query all at once
-                        #       instead?
                         (
-                            desc[0],
+                            column["name"],
                             PG_TO_ARROW.get(
-                                fetch_type_info_by_oid(
-                                    self.outgoing_conn, desc.type_code
-                                ),
+                                column["type"],
                                 pa.string(),
                             ),
                         )
-                        for desc in cursor.description
+                        for column in columns
                     ]
                 )
                 # TODO: well... if this is huge, ideally we want to stream the result back to the client
                 rows = cursor.fetchall()
                 data_columns = list(zip(*rows))
+                if self.observer is not None:
+                    self.observer.query_response(columns=columns, rows=list(rows))
                 # Convert data to PyArrow arrays
                 arrays = [
                     pa.array(data_columns[i], type=field.type)
@@ -111,6 +192,7 @@ class Connection(riffq.BaseConnection):
                 self.send_reader(record_batch, callback)
         except Exception as exc:
             logger.error("Failed to execute SQL", exc_info=True)
+            self.observer.query_error(error=str(exc))
             batch = self.arrow_batch(
                 # TODO: well, this is from the example. revealing details exc info may not be a good idea from the
                 #       perspective of security
@@ -120,20 +202,36 @@ class Connection(riffq.BaseConnection):
             self.send_reader(batch, callback)
 
     def handle_query(self, sql: str, callback: typing.Callable = callable, **kwargs):
+        # TODO: be careful with race condition for the audit trail writer
         self.executor.submit(self._handle_query, sql, callback, **kwargs)
 
 
 @click.command()
 @click.argument("DB_URL")
 @click.option(
-    "--host", default="localhost", help="The interface to listen connection from"
+    "--host",
+    default="localhost",
+    type=str,
+    help="The interface to listen connection from",
 )
 @click.option(
-    "--port", default=5433, help="Port number to listen for incoming connections."
+    "--port",
+    default=5433,
+    type=int,
+    help="Port number to listen for incoming connections.",
 )
-def main(db_url: str, host: str, port: int):
+@click.option(
+    "--audit-trail",
+    type=click.Path(dir_okay=True, file_okay=False, writable=True),
+    help="Write audit trial files to the given folder",
+)
+def main(db_url: str, host: str, port: int, audit_trail: str | None):
+    if audit_trail is not None:
+        audit_trail = AuditTrail(folder=pathlib.Path(audit_trail))
+
     server = riffq.RiffqServer(
-        f"{host}:{port}", connection_cls=functools.partial(Connection, db_url)
+        f"{host}:{port}",
+        connection_cls=functools.partial(Connection, db_url, audit_trail),
     )
     server.start(tls=False)
 
